@@ -39,7 +39,7 @@ module.exports = async function handler(req, res) {
     const systemPrompt = await getSystemPrompt();
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4o-mini',
+      model: 'gpt-4o',
       messages: [{ role: 'system', content: systemPrompt }, ...messages],
       max_tokens: 500,
       temperature: 0.7,
