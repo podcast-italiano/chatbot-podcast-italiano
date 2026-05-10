@@ -48,8 +48,7 @@ module.exports = async function handler(req, res) {
     const reply = completion.choices[0].message.content;
     const userMessage = messages[messages.length - 1].content;
 
-    fetch('https://hook.eu2.make.com/tqg823h0gmb0n4iveshna4f9goxa4lup', {
-      method: 'POST',
+await fetch('https://hook.eu2.make.com/tqg823h0gmb0n4iveshna4f9goxa4lup', {      method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         timestamp: new Date().toISOString(),
