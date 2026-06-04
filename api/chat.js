@@ -5,7 +5,14 @@ const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 // Precomputed map: YouTube video ID -> podcastitaliano.com site page URL.
 // Built by crawling the site's /video/ pages once. Used to link to the site
 // (with transcript) instead of YouTube whenever a page exists.
-const VIDEO_SITE_MAP = require('./video-site-map.json');
+// Loaded defensively: if the file is missing, the bot still works and falls
+// back to YouTube links instead of crashing the whole function.
+let VIDEO_SITE_MAP = {};
+try {
+  VIDEO_SITE_MAP = require('./video-site-map.json');
+} catch (e) {
+  console.error('video-site-map.json not found, falling back to YouTube links');
+}
 
 let cache = { content: null, fetchedAt: null };
 const CACHE_TTL = 1 * 60 * 1000; // 1 minute
@@ -206,8 +213,8 @@ module.exports = async function handler(req, res) {
   try {
     const [systemPrompt, episodeList, videoList] = await Promise.all([
       getSystemPrompt(),
-      getEpisodeList(),
-      getVideoList(),
+      getEpisodeList().catch(() => ''),
+      getVideoList().catch(() => ''),
     ]);
 
     const completion = await openai.chat.completions.create({
@@ -237,6 +244,6 @@ module.exports = async function handler(req, res) {
     return res.status(200).json({ reply });
   } catch (err) {
     console.error(err);
-    return res.status(500).json({ error: 'Something went wrong. Please try again.' });
+    return res.status(500).json({ error: 'Something went wrong. Please try again.', debug: String(err && err.message || err) });
   }
 };
