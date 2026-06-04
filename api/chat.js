@@ -2,6 +2,11 @@ const OpenAI = require('openai');
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
+// Precomputed map: YouTube video ID -> podcastitaliano.com site page URL.
+// Built by crawling the site's /video/ pages once. Used to link to the site
+// (with transcript) instead of YouTube whenever a page exists.
+const VIDEO_SITE_MAP = require('./video-site-map.json');
+
 let cache = { content: null, fetchedAt: null };
 const CACHE_TTL = 1 * 60 * 1000; // 1 minute
 
@@ -13,7 +18,13 @@ const RSS_FEEDS = [
   'https://rss.buzzsprout.com/2413795.rss', // Podcast Italiano (principale)
 ];
 
+// Published Google Sheet (CSV) with all YouTube videos: columns are
+// YT ID, title, YouTube URL, free PDF link.
+const VIDEO_CSV_URL = 'https://docs.google.com/spreadsheets/d/e/2PACX-1vSQWcqu1Rd6XolU9J8V2B5CxgIfqpkWJldNS720II6co76U-DPFsMmv9i2AvQ5depnmA4Z9GsE8u6fx/pub?gid=29836155&single=true&output=csv';
+const SITEMAP_URL = 'https://www.podcastitaliano.com/sitemap.xml';
+
 let episodeCache = { content: null, fetchedAt: null };
+let videoCache = { content: null, fetchedAt: null };
 const EPISODE_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
 async function getSystemPrompt() {
@@ -47,7 +58,6 @@ function parseFeed(xml) {
     const titleMatch = body.match(/<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/title>/);
     if (!titleMatch) continue;
     const title = decodeEntities(titleMatch[1]);
-    // Look for a podcastitaliano.com transcript link inside the item
     const linkMatch = body.match(/https?:\/\/(?:www\.)?podcastitaliano\.com\/podcast-episode\/[a-z0-9\-]+/i);
     const link = linkMatch ? linkMatch[0] : null;
     if (link) {
@@ -84,6 +94,97 @@ async function getEpisodeList() {
   return content;
 }
 
+// Parse a single CSV line, honoring quoted fields (titles can contain commas).
+function parseCsvLine(line) {
+  const out = [];
+  let cur = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (line[i + 1] === '"') { cur += '"'; i++; } else inQuotes = false;
+      } else cur += c;
+    } else {
+      if (c === ',') { out.push(cur); cur = ''; }
+      else if (c === '"') inQuotes = true;
+      else cur += c;
+    }
+  }
+  out.push(cur);
+  return out;
+}
+
+// Turn a video title into a Webflow-style slug, to match new videos against
+// the sitemap when they are not yet in the precomputed map.
+function slugify(s) {
+  return s.toLowerCase()
+    .normalize('NFD').replace(/[̀-ͯ]/g, '')
+    .replace(/['’"`]/g, '')
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+async function getVideoList() {
+  const now = Date.now();
+  if (videoCache.content && now - videoCache.fetchedAt < EPISODE_CACHE_TTL) {
+    return videoCache.content;
+  }
+
+  let csv = '';
+  try {
+    const r = await fetch(VIDEO_CSV_URL);
+    if (r.ok) csv = await r.text();
+  } catch (e) { /* ignore */ }
+  if (!csv) return videoCache.content || '';
+
+  // Build a set of /video/ slugs from the sitemap, to auto-resolve brand-new
+  // videos that are not yet in the precomputed VIDEO_SITE_MAP.
+  let slugSet = null;
+  try {
+    const sr = await fetch(SITEMAP_URL);
+    if (sr.ok) {
+      const xml = await sr.text();
+      slugSet = new Set();
+      const re = /\/video\/([a-z0-9-]+)/g;
+      let m;
+      while ((m = re.exec(xml)) !== null) slugSet.add(m[1]);
+    }
+  } catch (e) { /* ignore */ }
+
+  const lines = [];
+  for (const raw of csv.split(/\r?\n/)) {
+    if (!raw.trim()) continue;
+    const cols = parseCsvLine(raw);
+    const ytid = (cols[0] || '').trim();
+    const title = (cols[1] || '').trim();
+    const yturl = (cols[2] || '').trim();
+    const pdf = (cols[3] || '').trim();
+    if (!ytid || !title) continue;
+
+    // Prefer the site page (has transcript). Fall back to sitemap slug match
+    // for new videos, then to YouTube.
+    let link = VIDEO_SITE_MAP[ytid];
+    if (!link && slugSet) {
+      const slug = slugify(title);
+      if (slugSet.has(slug)) link = 'https://www.podcastitaliano.com/video/' + slug;
+    }
+    if (!link) link = yturl;
+
+    let line = `- ${title}: ${link}`;
+    if (pdf) line += ` | PDF gratuito: ${pdf}`;
+    lines.push(line);
+  }
+
+  const content = lines.length
+    ? '\n\n=== LISTA VIDEO YOUTUBE (titoli, link e PDF gratuiti) ===\n' +
+      'Quando un utente chiede di un video o di un argomento spiegato in un video, cerca qui il titolo corrispondente e fornisci il link. Preferisci SEMPRE il link a podcastitaliano.com quando presente (ha la trascrizione), usa il link YouTube solo se non c\'è quello del sito. Se il video ha un "PDF gratuito" associato, proponilo all\'utente. Se non trovi nulla che corrisponde, dillo onestamente.\n' +
+      lines.join('\n')
+    : '';
+  videoCache = { content, fetchedAt: now };
+  return content;
+}
+
 module.exports = async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', process.env.ALLOWED_ORIGIN || '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
@@ -103,12 +204,18 @@ module.exports = async function handler(req, res) {
   }
 
   try {
-    const systemPrompt = await getSystemPrompt();
-    const episodeList = await getEpisodeList();
+    const [systemPrompt, episodeList, videoList] = await Promise.all([
+      getSystemPrompt(),
+      getEpisodeList(),
+      getVideoList(),
+    ]);
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4o',
-      messages: [{ role: 'system', content: systemPrompt + episodeList }, ...messages],
+      messages: [
+        { role: 'system', content: systemPrompt + episodeList + videoList },
+        ...messages,
+      ],
       max_tokens: 500,
       temperature: 0.7,
     });
