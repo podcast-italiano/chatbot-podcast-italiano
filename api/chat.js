@@ -34,6 +34,36 @@ let episodeCache = { content: null, fetchedAt: null };
 let videoCache = { content: null, fetchedAt: null };
 const EPISODE_CACHE_TTL = 60 * 60 * 1000; // 1 hour
 
+function decodeAllEntities(str) {
+  return str
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => String.fromCharCode(parseInt(n, 16)));
+}
+
+// Google Docs "Publish to web" returns a full HTML page (with a huge inline
+// CSS block) that can be ~100k tokens. Strip it down to plain text so we only
+// send the actual knowledge base to the model. Safe no-op on plain text/markdown.
+function htmlToText(input) {
+  if (!/<\/?[a-z][\s\S]*>/i.test(input)) return input; // already plain text
+  let text = input;
+  const body = text.match(/<body[\s\S]*?>([\s\S]*?)<\/body>/i);
+  if (body) text = body[1];
+  text = text
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/(p|div|h[1-6]|li|tr)>/gi, '\n')
+    .replace(/<[^>]+>/g, '');
+  text = decodeAllEntities(text);
+  return text.replace(/\n{3,}/g, '\n\n').replace(/[ \t]{2,}/g, ' ').trim();
+}
+
 async function getSystemPrompt() {
   const now = Date.now();
   if (cache.content && now - cache.fetchedAt < CACHE_TTL) {
@@ -41,7 +71,8 @@ async function getSystemPrompt() {
   }
   const res = await fetch(process.env.SYSTEM_PROMPT_URL);
   if (!res.ok) throw new Error('Failed to fetch system prompt');
-  const content = await res.text();
+  const raw = await res.text();
+  const content = htmlToText(raw);
   cache = { content, fetchedAt: now };
   return content;
 }
@@ -208,6 +239,19 @@ module.exports = async function handler(req, res) {
 
   if (messages.length > 20) {
     return res.status(400).json({ error: 'Conversation limit reached' });
+  }
+
+  // TEMP diagnostic: report the size of each prompt component.
+  if (messages[0] && messages[0].content === '__debug__') {
+    const sp = await getSystemPrompt().catch((e) => 'ERR:' + e.message);
+    const ep = await getEpisodeList().catch(() => '');
+    const vd = await getVideoList().catch(() => '');
+    return res.status(200).json({
+      systemPrompt_chars: sp.length,
+      systemPrompt_head: sp.slice(0, 300),
+      episodes_chars: ep.length,
+      videos_chars: vd.length,
+    });
   }
 
   try {
